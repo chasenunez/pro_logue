@@ -1,7 +1,7 @@
 # proLogue
 ## TUI-ELN with version-controlled private storage
 
-A small terminal-based electroniclab notebook/bullet journal written in Rust.
+A small terminal-based electronic lab notebook/bullet journal written in Rust.
 It stores timestamped journal entries and tasks in a JSON file that lives in a **separate** Git repository (so your data can be private while the program repo stays public). The UI is text-based (ratatui + crossterm) and divided into four quadrants you navigate with `Tab` / `Shift+Tab`.
 
 ## Features
