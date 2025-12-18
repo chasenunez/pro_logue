@@ -1,4 +1,5 @@
-# ProLogue — Terminal Journal with Git-backed private storage
+# proLogue
+## TUI-ELN with version-controlled private storage
 
 A small terminal-first journaling app written in Rust.
 It stores timestamped journal entries and tasks in a JSON file that lives in a **separate** Git repository (so your data can be private while the program repo stays public). The UI is text-based (ratatui + crossterm) and divided into four quadrants you navigate with `Tab` / `Shift+Tab`.
