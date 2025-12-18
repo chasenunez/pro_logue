@@ -11,7 +11,7 @@ It stores timestamped journal entries and tasks in a JSON file that lives in a *
   * **ENTRY** (top-right) — type or paste text. `Enter` submits, `Shift+Enter` inserts newline.
   * **TASKS** (top-left) — tasks created by starting an entry with `*`. Select and press `Enter` to mark done (idempotent: only first `Enter` marks it done and adds a `DONE:` journal entry).
   * **SEARCH** (bottom-left) — search by words, comma-separated terms, or date `YYYY_MM_DD`. Press `Enter` with input to run a search; clear input and press `Enter` to open a selected result.
-  * **JOURNAL** (bottom-right) — shows today’s entries (reverse chronological).
+  * **CATALOGUE** (bottom-right) — shows today’s entries (reverse chronological).
 * Keyboard-first navigation:
 
   * `Tab` → advance focus (counter-clockwise): `ENTRY -> TASKS -> SEARCH -> JOURNAL -> ENTRY ...`
