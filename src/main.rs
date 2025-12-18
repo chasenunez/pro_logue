@@ -804,14 +804,14 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
     // ENTRY
     let entry_block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled("ENTRY (Enter=submit, Shift+Enter=newline)", Style::default().add_modifier(Modifier::BOLD)))
+        .title(Span::styled("NEW ENTRY", Style::default().add_modifier(Modifier::BOLD))) //(Enter=submit, Shift+Enter=newline)
         .border_style(if app.focus == Focus::Entry { Style::default().fg(Color::Green) } else { Style::default() });
     f.render_widget(Paragraph::new(Line::from(app.entry_buffer.clone())).block(entry_block).wrap(Wrap { trim: false }), top_cols[1]);
 
     // SEARCH
     let search_block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled("SEARCH (comma-separated). Enter (with input) runs search; Enter (empty input) opens selected", Style::default().add_modifier(Modifier::BOLD)))
+        .title(Span::styled("SEARCH", Style::default().add_modifier(Modifier::BOLD)))//(comma-separated). Enter (with input) runs search; Enter (empty input) opens selected
         .border_style(if app.focus == Focus::Search { Style::default().fg(Color::Cyan) } else { Style::default() });
 
     let mut search_lines: Vec<Line> = Vec::new();
@@ -858,7 +858,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
     }
     let journal_block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled("JOURNAL (today)", Style::default().add_modifier(Modifier::BOLD)))
+        .title(Span::styled("CATALOGUE", Style::default().add_modifier(Modifier::BOLD)))
         .border_style(if app.focus == Focus::Journal { Style::default().fg(Color::Blue) } else { Style::default() });
     f.render_widget(Paragraph::new(journal_lines).block(journal_block).wrap(Wrap { trim: false }), bottom_cols[1]);
 }
