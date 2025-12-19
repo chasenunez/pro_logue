@@ -1,3 +1,4 @@
+// Modified version of your program with scrolling + fractional layout config
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -15,7 +16,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Wrap, List, ListItem, ListState},
     Frame, Terminal,
 };
 use serde::{Deserialize, Serialize};
@@ -34,28 +35,35 @@ const GIT_BRANCH: &str = "main";
 const LOGO: &str = r#"┏━┓┏━┓┏━┓   ╻  ┏━┓┏━╸╻ ╻┏━╸
 ┣━┛┣┳┛┃ ┃   ┃  ┃ ┃┃╺┓┃ ┃┣╸ 
 ╹  ╹┗╸┗━┛╺━╸┗━╸┗━┛┗━┛┗━┛┗━╸"#;
+
+/// ---------------------------
+///// === LAYOUT CONFIG (fractions) ===
+/// ---------------------------
+/// Specify panel sizes here as fractions of 1.0 (they get converted to percent constraints).
+/// Adjust these to change the look quickly.
+const TOP_ROW_FRAC: f32 = 0.5;
+const BOTTOM_ROW_FRAC: f32 = 0.5;
+const LEFT_COL_FRAC: f32 = 0.5;
+const RIGHT_COL_FRAC: f32 = 0.5;
+const HEADER_HEIGHT_LINES: u16 = 3;
+
+fn frac_to_pct(f: f32) -> Constraint {
+    // clamp to [0.0, 1.0], convert to percentage u16
+    let f = if f.is_finite() { f.clamp(0.0, 1.0) } else { 0.0 };
+    let pct = (f * 100.0).round() as u16;
+    Constraint::Percentage(pct)
+}
+
 /// ---------------------------
 ///// === DATA MODELS ===
 /// ---------------------------
 
-/// Normalize a configured repository path string into an absolute PathBuf.
-///
-/// Behavior:
-/// - "~/<rest>" expands to $HOME/<rest>
-/// - If the input is already absolute (starts with '/'), it's returned as-is.
-/// - If the input starts with "./", the "./" is stripped and a leading '/' is added,
-///   so "./Users/..." -> "/Users/...".
-/// - If the input doesn't start with '/' or '~', treat it as an absolute path by
-///   prefixing a leading '/', so "Users/..." -> "/Users/...".
-
 fn normalize_repo_path<P: AsRef<str>>(s: P) -> PathBuf {
     let s = s.as_ref().trim();
     if s.is_empty() {
-        // fallback to current dir (shouldn't happen for your config)
         return std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     }
 
-    // Expand leading ~/
     if s.starts_with("~") {
         if s == "~" {
             if let Ok(home) = env::var("HOME") {
@@ -69,24 +77,19 @@ fn normalize_repo_path<P: AsRef<str>>(s: P) -> PathBuf {
     }
 
     let p = PathBuf::from(s);
-
-    // Already absolute: /something
     if p.is_absolute() {
         return p;
     }
 
-    // If user gave "./whatever" -> treat as "/whatever"
     if s.starts_with("./") {
         let trimmed = &s[2..];
         return PathBuf::from("/").join(trimmed);
     }
 
-    // Default: prefix with leading '/' to treat as absolute
     PathBuf::from("/").join(s)
 }
 
 fn data_file_name() -> String {
-    // produces "2025.json", "2026.json", etc.
     format!("{}.json", Local::now().year())
 }
 
@@ -94,7 +97,6 @@ fn data_file_name() -> String {
 struct JournalEntry {
     time: String, // "HH:MM"
     text: String,
-    /// New field: tags. Defaulted so older JSON without this field still deserializes.
     #[serde(default)]
     tags: Vec<String>,
 }
@@ -106,14 +108,12 @@ struct Task {
     created_at: String, // ISO
     #[serde(default)]
     completed_at: Option<String>,
-    /// New field: tags. Defaulted so older JSON without this field still deserializes.
     #[serde(default)]
     tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct DataFile {
-    /// Default the fields so entire file can be missing them and still load.
     #[serde(default)]
     journal: BTreeMap<String, Vec<JournalEntry>>,
     #[serde(default)]
@@ -133,7 +133,6 @@ enum Focus {
 }
 
 impl Focus {
-    /// NEXT follows ENTRY -> TASKS -> SEARCH -> JOURNAL -> ENTRY ...
     fn next(self) -> Focus {
         match self {
             Focus::Entry => Focus::Tasks,
@@ -156,7 +155,8 @@ struct AppState {
     data: DataFile,
     focus: Focus,
     entry_buffer: String,
-    journal_scroll: u16,
+    entry_scroll: u16, // vertical scroll offset for entry Paragraph
+    journal_scroll: usize,
     tasks_scroll: usize,
     search_input: String,
     search_results: Vec<(String, JournalEntry)>,
@@ -166,6 +166,11 @@ struct AppState {
     data_file_path: PathBuf,
     repo_path: PathBuf,
     location: String, // session location, stored as tag only
+
+    // Stateful widgets
+    tasks_state: ListState,
+    search_state: ListState,
+    journal_state: ListState,
 }
 
 impl AppState {
@@ -176,13 +181,11 @@ impl AppState {
         fs::create_dir_all(&repo_path)
             .with_context(|| format!("couldn't create repository dir {:?}", repo_path))?;
 
-        // Read file if present, otherwise create default JSON.
         let data: DataFile = if data_file_path.exists() {
             let mut f = File::open(&data_file_path)
                 .with_context(|| format!("failed to open data file {:?}", data_file_path))?;
             let mut s = String::new();
             f.read_to_string(&mut s).with_context(|| "failed to read data file")?;
-            // serde will supply defaults for missing fields (tags etc.)
             serde_json::from_str(&s).with_context(|| "failed to parse JSON data file")?
         } else {
             let df = DataFile::default();
@@ -193,7 +196,6 @@ impl AppState {
             df
         };
 
-        // compute next_task_id from existing tasks
         let mut next_task_id = 1u64;
         for t in &data.tasks {
             if t.id >= next_task_id {
@@ -201,10 +203,18 @@ impl AppState {
             }
         }
 
+        let mut tasks_state = ListState::default();
+        if !data.tasks.is_empty() {
+            tasks_state.select(Some(0));
+        }
+        let search_state = ListState::default();
+        let journal_state = ListState::default();
+
         Ok(Self {
             data,
             focus: Focus::Entry,
             entry_buffer: String::new(),
+            entry_scroll: 0,
             journal_scroll: 0,
             tasks_scroll: 0,
             search_input: String::new(),
@@ -215,31 +225,28 @@ impl AppState {
             data_file_path,
             repo_path,
             location,
+            tasks_state,
+            search_state,
+            journal_state,
         })
     }
 
     fn persist(&mut self) -> Result<()> {
-    // If the year changed since we started, switch to the new year's file.
-    let expected = self.repo_path.join(data_file_name());
-    if expected != self.data_file_path {
-        // ensure repo dir exists
-        fs::create_dir_all(&self.repo_path)
-            .with_context(|| format!("couldn't create repository dir {:?}", self.repo_path))?;
-        // update path — we'll write `self.data` into the new file below
-        self.data_file_path = expected;
+        let expected = self.repo_path.join(data_file_name());
+        if expected != self.data_file_path {
+            fs::create_dir_all(&self.repo_path)
+                .with_context(|| format!("couldn't create repository dir {:?}", self.repo_path))?;
+            self.data_file_path = expected;
+        }
+
+        let tmp = self.data_file_path.with_extension("json.tmp");
+        let mut f = File::create(&tmp).with_context(|| format!("failed to create temp file {:?}", tmp))?;
+        let s = serde_json::to_string_pretty(&self.data).context("failed to serialize data file")?;
+        f.write_all(s.as_bytes()).with_context(|| "failed writing serialized data to temp file")?;
+        fs::rename(&tmp, &self.data_file_path).with_context(|| "failed to rename temp data file")?;
+        Ok(())
     }
 
-    // Write to a temp file and atomically rename
-    let tmp = self.data_file_path.with_extension("json.tmp");
-    let mut f = File::create(&tmp).with_context(|| format!("failed to create temp file {:?}", tmp))?;
-    let s = serde_json::to_string_pretty(&self.data).context("failed to serialize data file")?;
-    f.write_all(s.as_bytes()).with_context(|| "failed writing serialized data to temp file")?;
-    fs::rename(&tmp, &self.data_file_path).with_context(|| "failed to rename temp data file")?;
-    Ok(())
-}
-
-
-    /// Add journal entry; tags param used to add tags (e.g. location)
     fn add_entry_for_now(&mut self, text: String, tags: Vec<String>) -> Result<()> {
         let now = Local::now();
         let date_key = now.format("%Y_%m_%d").to_string();
@@ -253,7 +260,6 @@ impl AppState {
         Ok(())
     }
 
-    /// Add task (uses next_task_id, increments it)
     fn add_task(&mut self, text: String, tags: Vec<String>) -> Result<()> {
         let now = Local::now();
         let t = Task {
@@ -265,11 +271,13 @@ impl AppState {
         };
         self.next_task_id += 1;
         self.data.tasks.push(t);
+        // ensure tasks_state selection is valid
+        if self.tasks_scroll >= self.data.tasks.len() {
+            self.tasks_scroll = self.data.tasks.len().saturating_sub(1);
+        }
         Ok(())
     }
 
-    /// Complete a task: set completed_at and add DONE entry with same tags
-    /// (does not check idempotence here — that is handled at call site)
     fn complete_task(&mut self, idx: usize) -> Result<()> {
         if idx >= self.data.tasks.len() {
             return Ok(());
@@ -284,22 +292,17 @@ impl AppState {
         Ok(())
     }
 
-    /// Ensure there is one Clock-in/Clock-out entry for today.
-    /// If a "Clock-in:" entry already exists for today, do nothing.
-    /// Otherwise create one using current time as CLOCK_IN and CLOCK_OUT = CLOCK_IN + (9h on Mon/Tue else 8h).
     fn ensure_daily_clock_entry(&mut self) -> Result<()> {
         let today_key = Local::now().format("%Y_%m_%d").to_string();
 
         if let Some(entries) = self.data.journal.get(&today_key) {
             for e in entries {
                 if e.text.starts_with("Clock-in:") {
-                    // already present -> nothing to do
                     return Ok(());
                 }
             }
         }
 
-        // Not present -> create it now
         let now = Local::now();
         let clock_in = now.format("%H:%M").to_string();
         let weekday = now.weekday();
@@ -319,7 +322,6 @@ impl AppState {
         }
 
         self.add_entry_for_now(entry_text.clone(), tags)?;
-        // persist and git-commit the clock entry immediately
         self.persist()?;
         if let Err(e) = self.git_commit_and_push(&format!("Add clock entry: {}", entry_text)) {
             warn!("git push failed: {:?}", e);
@@ -327,7 +329,6 @@ impl AppState {
         Ok(())
     }
 
-    /// Remove completed tasks that were completed before today
     fn prune_old_completed_tasks(&mut self) {
         let today = Local::now().date_naive();
         self.data.tasks.retain(|t| match &t.completed_at {
@@ -340,9 +341,11 @@ impl AppState {
             }
             None => true,
         });
+        if self.tasks_scroll >= self.data.tasks.len() {
+            self.tasks_scroll = self.data.tasks.len().saturating_sub(1);
+        }
     }
 
-    /// Search matches date_key, entry.text, OR entry.tags (case-insensitive)
     fn run_search(&mut self) {
         self.search_selected_detail = None;
         let raw = self.search_input.clone();
@@ -356,6 +359,7 @@ impl AppState {
         if terms.is_empty() {
             self.search_results = results;
             self.search_scroll = 0;
+            self.search_state.select(None);
             return;
         }
 
@@ -399,9 +403,13 @@ impl AppState {
 
         self.search_results = results;
         self.search_scroll = 0;
+        if !self.search_results.is_empty() {
+            self.search_state.select(Some(0));
+        } else {
+            self.search_state.select(None);
+        }
     }
 
-    /// commit & push (best-effort)
     fn git_commit_and_push(&self, message: &str) -> Result<()> {
         if !COMMIT_AND_PUSH {
             info!("COMMIT_AND_PUSH disabled; skipping git operations.");
@@ -492,20 +500,14 @@ fn main() -> Result<()> {
 
     env_logger::Builder::from_default_env().format_timestamp(None).init();
 
-    // Load application state, passing session location
     let repo_path = normalize_repo_path(GIT_REPO_PATH);
-    //let mut app = AppState::load(repo_path, DATA_FILE_NAME, location).with_context(|| "failed to load application state")?;
     let data_filename = data_file_name();
     let mut app = AppState::load(repo_path.clone(), &data_filename, location).with_context(|| "failed to load application state")?;
 
-
-    // Prune older completed tasks
     app.prune_old_completed_tasks();
 
-    // Create a daily clock-in/out entry if needed (idempotent per day)
     if let Err(e) = app.ensure_daily_clock_entry() {
         warn!("Failed to create daily clock entry: {:?}", e);
-        // continue running even if clock-entry creation fails
     }
 
     crossterm::terminal::enable_raw_mode().context("enable raw mode")?;
@@ -582,7 +584,6 @@ fn handle_key_event(app: &mut AppState, key: KeyEvent) -> Result<()> {
             }
             // Enter (no shift) => submit
             KeyEvent { code: KeyCode::Enter, modifiers, .. } if !modifiers.contains(KeyModifiers::SHIFT) && !modifiers.contains(KeyModifiers::CONTROL) => {
-                // build tags (include session location as a tag if set)
                 let mut tags = vec![];
                 if !app.location.is_empty() {
                     tags.push(app.location.clone());
@@ -590,12 +591,14 @@ fn handle_key_event(app: &mut AppState, key: KeyEvent) -> Result<()> {
                 let text = app.entry_buffer.trim().to_string();
                 if !text.is_empty() {
                     if text.starts_with('*') {
-                        // create task
                         app.add_task(text.trim_start_matches('*').trim().to_string(), tags.clone()).with_context(|| "failed to add task")?;
                         app.persist().with_context(|| "failed to persist after adding task")?;
                         if let Err(e) = app.git_commit_and_push(&format!("Add task")) {
                             warn!("git push failed: {:?}", e);
                         }
+                        // keep focus in entry but move tasks selection to new item
+                        app.tasks_scroll = app.data.tasks.len().saturating_sub(1);
+                        app.tasks_state.select(Some(app.tasks_scroll));
                     } else {
                         app.add_entry_for_now(text.clone(), tags.clone()).with_context(|| "failed to add entry")?;
                         app.persist().with_context(|| "failed to persist after adding entry")?;
@@ -605,6 +608,7 @@ fn handle_key_event(app: &mut AppState, key: KeyEvent) -> Result<()> {
                     }
                 }
                 app.entry_buffer.clear();
+                app.entry_scroll = 0;
             }
             // Accept chars including capitals (ignore Ctrl combos)
             KeyEvent { code: KeyCode::Char(c), modifiers, .. } => {
@@ -615,6 +619,15 @@ fn handle_key_event(app: &mut AppState, key: KeyEvent) -> Result<()> {
             KeyEvent { code: KeyCode::Backspace, .. } => {
                 app.entry_buffer.pop();
             }
+            KeyEvent { code: KeyCode::Up, .. } => {
+                if app.entry_scroll > 0 {
+                    app.entry_scroll -= 1;
+                }
+            }
+            KeyEvent { code: KeyCode::Down, .. } => {
+                // we do not know exact max lines; allow growth but cap to some safe limit
+                app.entry_scroll = app.entry_scroll.saturating_add(1).min(10_000);
+            }
             _ => {}
         },
         Focus::Tasks => match key {
@@ -622,26 +635,23 @@ fn handle_key_event(app: &mut AppState, key: KeyEvent) -> Result<()> {
                 if app.tasks_scroll > 0 {
                     app.tasks_scroll -= 1;
                 }
+                app.tasks_state.select(Some(app.tasks_scroll));
             }
             KeyEvent { code: KeyCode::Down, .. } => {
                 if app.tasks_scroll + 1 < app.data.tasks.len() {
                     app.tasks_scroll += 1;
                 }
+                app.tasks_state.select(Some(app.tasks_scroll));
             }
-            // Enter completes selected task; focus remains in TASKS.
-            // Now idempotent: if already completed, do nothing.
             KeyEvent { code: KeyCode::Enter, .. } => {
                 let idx = app.tasks_scroll;
                 if idx < app.data.tasks.len() {
-                    // Check idempotence: only complete if not already completed.
                     if app.data.tasks[idx].completed_at.is_none() {
                         app.complete_task(idx).with_context(|| "failed to complete task")?;
                         app.persist().with_context(|| "failed to persist after completing task")?;
                         if let Err(e) = app.git_commit_and_push("Complete task") {
                             warn!("git push failed: {:?}", e);
                         }
-                    } else {
-                        // already completed: do nothing
                     }
                 }
             }
@@ -685,6 +695,9 @@ fn handle_key_event(app: &mut AppState, key: KeyEvent) -> Result<()> {
                 } else if app.search_scroll > 0 {
                     app.search_scroll -= 1;
                 }
+                if !app.search_results.is_empty() {
+                    app.search_state.select(Some(app.search_scroll));
+                }
             }
             KeyEvent { code: KeyCode::Down, .. } => {
                 if !app.search_results.is_empty() {
@@ -692,6 +705,9 @@ fn handle_key_event(app: &mut AppState, key: KeyEvent) -> Result<()> {
                     if app.search_scroll < max {
                         app.search_scroll += 1;
                     }
+                }
+                if !app.search_results.is_empty() {
+                    app.search_state.select(Some(app.search_scroll));
                 }
             }
             _ => {}
@@ -701,9 +717,11 @@ fn handle_key_event(app: &mut AppState, key: KeyEvent) -> Result<()> {
                 if app.journal_scroll > 0 {
                     app.journal_scroll -= 1;
                 }
+                app.journal_state.select(Some(app.journal_scroll));
             }
             KeyEvent { code: KeyCode::Down, .. } => {
                 app.journal_scroll = app.journal_scroll.saturating_add(1);
+                app.journal_state.select(Some(app.journal_scroll));
             }
             _ => {}
         },
@@ -712,10 +730,11 @@ fn handle_key_event(app: &mut AppState, key: KeyEvent) -> Result<()> {
 }
 
 /// Render the UI with 3-line header (logo left, date+location on right bottom header).
-fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
+/// NOTE: ui now takes `&mut AppState` because we need to pass mutable `ListState`s to the frame.
+fn ui<B: Backend>(f: &mut Frame<B>, app: &mut AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
+        .constraints([Constraint::Length(HEADER_HEIGHT_LINES), Constraint::Min(0)].as_ref())
         .split(f.size());
 
     let header_rows = Layout::default()
@@ -755,31 +774,33 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
         f.render_widget(meta_para, *col);
     }
 
-    // Body => two rows of quadrants
+    // Body -> rows and columns using configurable fractions
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+        .constraints([frac_to_pct(TOP_ROW_FRAC), frac_to_pct(BOTTOM_ROW_FRAC)].as_ref())
         .split(chunks[1]);
 
     let top_cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+        .constraints([frac_to_pct(LEFT_COL_FRAC), frac_to_pct(RIGHT_COL_FRAC)].as_ref())
         .split(rows[0]);
 
     let bottom_cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+        .constraints([frac_to_pct(LEFT_COL_FRAC), frac_to_pct(RIGHT_COL_FRAC)].as_ref())
         .split(rows[1]);
 
-    // TASKS
+    // ---------------- TASKS (left top)
+    let tasks_count = app.data.tasks.len();
+    let tasks_title = format!("TASKS ({}/{})", app.tasks_scroll.saturating_add(1), tasks_count.max(1));
     let tasks_block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled("TASKS", Style::default().add_modifier(Modifier::BOLD)))
+        .title(Span::styled(tasks_title, Style::default().add_modifier(Modifier::BOLD)))
         .border_style(if app.focus == Focus::Tasks { Style::default().fg(Color::Magenta) } else { Style::default() });
 
-    let mut tasks_lines: Vec<Line> = Vec::new();
+    let mut task_items: Vec<ListItem> = Vec::new();
     if app.data.tasks.is_empty() {
-        tasks_lines.push(Line::from(Span::raw("(no tasks)")));
+        task_items.push(ListItem::new(Span::raw("(no tasks)")));
     } else {
         let today = Local::now().date_naive();
         for (i, t) in app.data.tasks.iter().enumerate() {
@@ -796,69 +817,123 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
             if i == app.tasks_scroll && app.focus == Focus::Tasks {
                 style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
             }
-            tasks_lines.push(Line::from(Span::styled(s, style)));
+            task_items.push(ListItem::new(Span::styled(s, style)));
         }
     }
-    f.render_widget(Paragraph::new(tasks_lines).block(tasks_block).wrap(Wrap { trim: false }), top_cols[0]);
 
-    // ENTRY
+    let tasks_list = List::new(task_items).block(tasks_block).highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+    // make sure the state selection mirrors tasks_scroll
+    if !app.data.tasks.is_empty() {
+        app.tasks_state.select(Some(app.tasks_scroll));
+    } else {
+        app.tasks_state.select(None);
+    }
+    f.render_stateful_widget(tasks_list, top_cols[0], &mut app.tasks_state);
+
+    // ---------------- ENTRY (right top)
     let entry_block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled("NEW ENTRY", Style::default().add_modifier(Modifier::BOLD))) //(Enter=submit, Shift+Enter=newline)
+        .title(Span::styled("NEW ENTRY", Style::default().add_modifier(Modifier::BOLD)))
         .border_style(if app.focus == Focus::Entry { Style::default().fg(Color::Green) } else { Style::default() });
-    f.render_widget(Paragraph::new(Line::from(app.entry_buffer.clone())).block(entry_block).wrap(Wrap { trim: false }), top_cols[1]);
 
-    // SEARCH
+    // Entry paragraph supports scroll offset
+    let entry_para = Paragraph::new(Line::from(app.entry_buffer.clone()))
+        .block(entry_block)
+        .wrap(Wrap { trim: false })
+        .scroll((app.entry_scroll, 0));
+    f.render_widget(entry_para, top_cols[1]);
+
+    // ---------------- SEARCH (left bottom)
+    // split search area into input / results vertically
+    let search_cols = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
+        .split(bottom_cols[0]);
+
     let search_block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled("SEARCH", Style::default().add_modifier(Modifier::BOLD)))//(comma-separated). Enter (with input) runs search; Enter (empty input) opens selected
+        .title(Span::styled(
+            format!("SEARCH (results: {})", app.search_results.len()),
+            Style::default().add_modifier(Modifier::BOLD),
+        ))
         .border_style(if app.focus == Focus::Search { Style::default().fg(Color::Cyan) } else { Style::default() });
 
-    let mut search_lines: Vec<Line> = Vec::new();
-    search_lines.push(Line::from(Span::styled(format!("> {}", app.search_input), Style::default().add_modifier(Modifier::BOLD))));
-    search_lines.push(Line::from(Span::raw("")));
+    // Top small area: input or selected detail
+    let mut input_lines: Vec<Line> = Vec::new();
     if let Some((dk, entry)) = &app.search_selected_detail {
-        search_lines.push(Line::from(Span::styled(format!("{} {}", dk, entry.time), Style::default().add_modifier(Modifier::BOLD))));
-        search_lines.push(Line::from(Span::raw(&entry.text)));
+        input_lines.push(Line::from(Span::styled(format!("{} {}", dk, entry.time), Style::default().add_modifier(Modifier::BOLD))));
+        input_lines.push(Line::from(Span::raw(&entry.text)));
         if !entry.tags.is_empty() {
-            search_lines.push(Line::from(Span::raw(format!("tags: {}", entry.tags.join(", ")))));
+            input_lines.push(Line::from(Span::raw(format!("tags: {}", entry.tags.join(", ")))));
         }
-        search_lines.push(Line::from(Span::raw("")));
-        search_lines.push(Line::from(Span::raw("(Press Backspace when search input empty to clear detail)")));
+        input_lines.push(Line::from(Span::raw("(Backspace (when input empty) clears detail)")));
     } else {
-        if app.search_results.is_empty() {
-            search_lines.push(Line::from(Span::raw("(no results)")));
-        } else {
-            for (i, (date, entry)) in app.search_results.iter().enumerate() {
-                let mut style = Style::default();
-                if app.focus == Focus::Search && app.search_scroll == i {
-                    style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
-                }
-                search_lines.push(Line::from(Span::styled(format!("{} {} — {}", date, entry.time, entry.text), style)));
-            }
-        }
+        input_lines.push(Line::from(Span::styled(format!("> {}", app.search_input), Style::default().add_modifier(Modifier::BOLD))));
+        input_lines.push(Line::from(Span::raw("Press Ctrl+G or Enter (empty input) to run/open results")));
+        input_lines.push(Line::from(Span::raw("")));
     }
-    f.render_widget(Paragraph::new(search_lines).block(search_block).wrap(Wrap { trim: false }), bottom_cols[0]);
+    let input_para = Paragraph::new(input_lines).block(search_block.clone());
+    f.render_widget(input_para, search_cols[0]);
 
-    // JOURNAL (today)
-    let today_key = Local::now().format("%Y_%m_%d").to_string();
-    let mut journal_lines: Vec<Line> = Vec::new();
-    if let Some(entries) = app.data.journal.get(&today_key) {
-        if entries.is_empty() {
-            journal_lines.push(Line::from(Span::raw("(no entries today)")));
-        } else {
-            let mut rev = entries.clone();
-            rev.reverse();
-            for e in &rev {
-                journal_lines.push(Line::from(Span::raw(format!("{} {}", e.time, e.text))));
-            }
-        }
+    // Bottom: results list
+    let mut search_items: Vec<ListItem> = Vec::new();
+    if app.search_selected_detail.is_some() {
+        // show nothing in results when detail is open
+        search_items.push(ListItem::new(Span::raw("(detail open)")));
+    } else if app.search_results.is_empty() {
+        search_items.push(ListItem::new(Span::raw("(no results)")));
     } else {
-        journal_lines.push(Line::from(Span::raw("(no entries today)")));
+        for (i, (date, entry)) in app.search_results.iter().enumerate() {
+            let mut style = Style::default();
+            if app.focus == Focus::Search && app.search_scroll == i {
+                style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+            }
+            let text = format!("{} {} — {}", date, entry.time, entry.text);
+            search_items.push(ListItem::new(Span::styled(text, style)));
+        }
     }
+    let search_list = List::new(search_items).block(Block::default().borders(Borders::ALL).title("RESULTS")).highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+    if !app.search_results.is_empty() && app.search_selected_detail.is_none() {
+        app.search_state.select(Some(app.search_scroll));
+    } else {
+        app.search_state.select(None);
+    }
+    f.render_stateful_widget(search_list, search_cols[1], &mut app.search_state);
+
+    // ---------------- JOURNAL (right bottom)
     let journal_block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled("CATALOGUE", Style::default().add_modifier(Modifier::BOLD)))
         .border_style(if app.focus == Focus::Journal { Style::default().fg(Color::Blue) } else { Style::default() });
-    f.render_widget(Paragraph::new(journal_lines).block(journal_block).wrap(Wrap { trim: false }), bottom_cols[1]);
+
+    // gather today's entries reversed (most recent first)
+    let today_key = Local::now().format("%Y_%m_%d").to_string();
+    let mut journal_items: Vec<ListItem> = Vec::new();
+    if let Some(entries) = app.data.journal.get(&today_key) {
+        if entries.is_empty() {
+            journal_items.push(ListItem::new(Span::raw("(no entries today)")));
+        } else {
+            let mut rev = entries.clone();
+            rev.reverse();
+            for e in &rev {
+                let text = format!("{} {}", e.time, e.text);
+                journal_items.push(ListItem::new(Span::raw(text)));
+            }
+        }
+    } else {
+        journal_items.push(ListItem::new(Span::raw("(no entries today)")));
+    }
+
+    let journal_list = List::new(journal_items).block(journal_block).highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+    // cap journal_scroll to available items
+    let journal_len = if let Some(entries) = app.data.journal.get(&today_key) { entries.len() } else { 0 };
+    if journal_len == 0 {
+        app.journal_state.select(None);
+    } else {
+        if app.journal_scroll >= journal_len {
+            app.journal_scroll = journal_len.saturating_sub(1);
+        }
+        app.journal_state.select(Some(app.journal_scroll));
+    }
+    f.render_stateful_widget(journal_list, bottom_cols[1], &mut app.journal_state);
 }
