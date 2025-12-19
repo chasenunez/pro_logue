@@ -476,13 +476,38 @@ impl AppState {
         Ok(())
     }
 }
-
 /// ---------------------------
 ///// === UI / Main Loop ===
 /// ---------------------------
 
+/// Normalize repo path into absolute PathBuf (expands ~, treats "./Users/..." as "/Users/...")
+fn normalize_repo_path<P: AsRef<str>>(s: P) -> PathBuf {
+    let s = s.as_ref().trim();
+    if s.is_empty() {
+        return env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    }
+    if s.starts_with('~') {
+        if let Ok(home) = env::var("HOME") {
+            if s == "~" {
+                return PathBuf::from(home);
+            } else if s.starts_with("~/") {
+                return PathBuf::from(home).join(&s[2..]);
+            }
+        }
+    }
+    let p = PathBuf::from(s);
+    if p.is_absolute() {
+        return p;
+    }
+    if s.starts_with("./") {
+        let trimmed = &s[2..];
+        return PathBuf::from("/").join(trimmed);
+    }
+    PathBuf::from("/").join(s)
+}
+
 fn main() -> Result<()> {
-    // Prompt location in normal mode
+    // Prompt for LOCATION before entering TUI
     println!("{}", LOGO);
     print!("LOCATION: ");
     io::Write::flush(&mut io::stdout()).ok();
@@ -492,20 +517,11 @@ fn main() -> Result<()> {
 
     env_logger::Builder::from_default_env().format_timestamp(None).init();
 
-    // Load application state, passing session location
     let repo_path = normalize_repo_path(GIT_REPO_PATH);
-    //let mut app = AppState::load(repo_path, DATA_FILE_NAME, location).with_context(|| "failed to load application state")?;
-    let data_filename = data_file_name();
-    let mut app = AppState::load(repo_path.clone(), &data_filename, location).with_context(|| "failed to load application state")?;
-
-
-    // Prune older completed tasks
+    let mut app = AppState::load(repo_path, DATA_FILE_NAME, location).with_context(|| "failed to load application state")?;
     app.prune_old_completed_tasks();
-
-    // Create a daily clock-in/out entry if needed (idempotent per day)
     if let Err(e) = app.ensure_daily_clock_entry() {
         warn!("Failed to create daily clock entry: {:?}", e);
-        // continue running even if clock-entry creation fails
     }
 
     crossterm::terminal::enable_raw_mode().context("enable raw mode")?;
@@ -540,7 +556,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut AppS
                         break;
                     }
 
-                    // Global Tab / BackTab: only these change focus
+                    // Tab/backtab change focus only
                     if let KeyEvent { code: KeyCode::Tab, modifiers, .. } = key {
                         if modifiers.contains(KeyModifiers::SHIFT) {
                             app.focus = app.focus.prev();
@@ -554,11 +570,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut AppS
                         continue;
                     }
 
-                    // else dispatch to focus handler
+                    // dispatch to focus handler
                     handle_key_event(app, key)?;
                 }
                 CEvent::Paste(s) => {
-                    // preserve CR/LF
+                    // preserve pasted newlines
                     match app.focus {
                         Focus::Entry => app.entry_buffer.push_str(&s),
                         Focus::Search => app.search_input.push_str(&s),
@@ -572,17 +588,16 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut AppS
     Ok(())
 }
 
-/// Handle key events in each quadrant. Focus changes only via Tab/BackTab in run_app.
+/// Handle key events inside the focused quadrant. Focus only changes using Tab/Shift+Tab.
 fn handle_key_event(app: &mut AppState, key: KeyEvent) -> Result<()> {
     match app.focus {
         Focus::Entry => match key {
-            // Shift+Enter => newline
+            // Shift+Enter => insert newline
             KeyEvent { code: KeyCode::Enter, modifiers, .. } if modifiers.contains(KeyModifiers::SHIFT) => {
                 app.entry_buffer.push('\n');
             }
-            // Enter (no shift) => submit
+            // Enter (no shift) => submit entry
             KeyEvent { code: KeyCode::Enter, modifiers, .. } if !modifiers.contains(KeyModifiers::SHIFT) && !modifiers.contains(KeyModifiers::CONTROL) => {
-                // build tags (include session location as a tag if set)
                 let mut tags = vec![];
                 if !app.location.is_empty() {
                     tags.push(app.location.clone());
@@ -590,23 +605,22 @@ fn handle_key_event(app: &mut AppState, key: KeyEvent) -> Result<()> {
                 let text = app.entry_buffer.trim().to_string();
                 if !text.is_empty() {
                     if text.starts_with('*') {
-                        // create task
                         app.add_task(text.trim_start_matches('*').trim().to_string(), tags.clone()).with_context(|| "failed to add task")?;
                         app.persist().with_context(|| "failed to persist after adding task")?;
-                        if let Err(e) = app.git_commit_and_push(&format!("Add task")) {
+                        if let Err(e) = app.git_commit_and_push("Add task") {
                             warn!("git push failed: {:?}", e);
                         }
                     } else {
                         app.add_entry_for_now(text.clone(), tags.clone()).with_context(|| "failed to add entry")?;
                         app.persist().with_context(|| "failed to persist after adding entry")?;
-                        if let Err(e) = app.git_commit_and_push(&format!("Add entry")) {
+                        if let Err(e) = app.git_commit_and_push("Add entry") {
                             warn!("git push failed: {:?}", e);
                         }
                     }
                 }
                 app.entry_buffer.clear();
             }
-            // Accept chars including capitals (ignore Ctrl combos)
+            // Accept printable characters (including capitals); ignore Ctrl combos
             KeyEvent { code: KeyCode::Char(c), modifiers, .. } => {
                 if !modifiers.contains(KeyModifiers::CONTROL) {
                     app.entry_buffer.push(c);
@@ -628,31 +642,27 @@ fn handle_key_event(app: &mut AppState, key: KeyEvent) -> Result<()> {
                     app.tasks_scroll += 1;
                 }
             }
-            // Enter completes selected task; focus remains in TASKS.
-            // Now idempotent: if already completed, do nothing.
+            // Enter completes selected task (idempotent)
             KeyEvent { code: KeyCode::Enter, .. } => {
                 let idx = app.tasks_scroll;
                 if idx < app.data.tasks.len() {
-                    // Check idempotence: only complete if not already completed.
                     if app.data.tasks[idx].completed_at.is_none() {
                         app.complete_task(idx).with_context(|| "failed to complete task")?;
                         app.persist().with_context(|| "failed to persist after completing task")?;
                         if let Err(e) = app.git_commit_and_push("Complete task") {
                             warn!("git push failed: {:?}", e);
                         }
-                    } else {
-                        // already completed: do nothing
                     }
                 }
             }
             _ => {}
         },
         Focus::Search => match key {
-            // Ctrl+g -> run search
+            // Ctrl+G runs search
             KeyEvent { code: KeyCode::Char('g'), modifiers, .. } if modifiers.contains(KeyModifiers::CONTROL) => {
                 app.run_search();
             }
-            // Enter: if input non-empty -> run search (ensures fresh searches after backspacing), else open selected result
+            // Enter: run search if input non-empty else open selected result
             KeyEvent { code: KeyCode::Enter, modifiers, .. } => {
                 if !app.search_input.trim().is_empty() {
                     app.run_search();
@@ -681,8 +691,7 @@ fn handle_key_event(app: &mut AppState, key: KeyEvent) -> Result<()> {
                 }
             }
             KeyEvent { code: KeyCode::Up, .. } => {
-                if app.search_results.is_empty() {
-                } else if app.search_scroll > 0 {
+                if app.search_scroll > 0 {
                     app.search_scroll -= 1;
                 }
             }
@@ -703,7 +712,15 @@ fn handle_key_event(app: &mut AppState, key: KeyEvent) -> Result<()> {
                 }
             }
             KeyEvent { code: KeyCode::Down, .. } => {
-                app.journal_scroll = app.journal_scroll.saturating_add(1);
+                let today_key = Local::now().format("%Y_%m_%d").to_string();
+                if let Some(entries) = app.data.journal.get(&today_key) {
+                    if !entries.is_empty() {
+                        let max = entries.len().saturating_sub(1) as u16;
+                        if app.journal_scroll < max {
+                            app.journal_scroll += 1;
+                        }
+                    }
+                }
             }
             _ => {}
         },
@@ -711,24 +728,22 @@ fn handle_key_event(app: &mut AppState, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
-/// Render the UI with 3-line header (logo left, date+location on right bottom header).
-/// Scrolling behavior:
-/// - TASKS & SEARCH compute a view offset so the selected index is visible.
-/// - JOURNAL uses app.journal_scroll as an explicit offset (clamped).
-/// Render the UI with 3-line header (logo left, date+location on right bottom header).
-/// Selected-item-at-top behavior for SEARCH, TASKS and JOURNAL so selection is always visible.
+/// Render UI: header (3 lines) + 2x2 grid of quadrants.
+/// TASKS / SEARCH / JOURNAL render the selected item at the top so selection is always visible.
 fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
+    // header + body
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
         .split(f.size());
 
+    // header rows (3 lines)
     let header_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)].as_ref())
         .split(chunks[0]);
 
-    // Prepare left and right cols for each header row
+    // left & right columns for each header row
     let mut left_cols = Vec::new();
     let mut right_cols = Vec::new();
     for row in header_rows.iter() {
@@ -740,7 +755,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
         right_cols.push(cols[1]);
     }
 
-    // Render logo lines into the LEFT columns (one line per header row).
+    // render logo lines (one line per header row) on left
     let logo_lines: Vec<&str> = LOGO.lines().collect();
     for (i, col) in left_cols.iter().enumerate() {
         let text = logo_lines.get(i).copied().unwrap_or("");
@@ -748,22 +763,19 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
         f.render_widget(p, *col);
     }
 
-    // Render date + location into the RIGHT column of the last header row (index 2).
+    // render date + location on right side of last header row
     let date_str = Local::now().format("%A, %e %B").to_string();
     let location_display = if app.location.is_empty() { "Unknown" } else { &app.location };
     let meta = format!("Working from {} on {}", location_display, date_str.trim());
-    let meta_para = Paragraph::new(Line::from(Span::styled(
-        meta,
-        Style::default().add_modifier(Modifier::BOLD),
-    )))
-    .block(Block::default());
+    let meta_para = Paragraph::new(Line::from(Span::styled(meta, Style::default().add_modifier(Modifier::BOLD))))
+        .block(Block::default());
     if right_cols.len() >= 3 {
         f.render_widget(meta_para, right_cols[2]);
     } else if let Some(col) = right_cols.last() {
         f.render_widget(meta_para, *col);
     }
 
-    // Body => two rows of quadrants
+    // body -> two rows, each 50%
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
@@ -780,7 +792,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
         .split(rows[1]);
 
     // -----------------------
-    // TASKS
+    // TASKS (top-left) — selected task shown at top then list
     // -----------------------
     let tasks_block = Block::default()
         .borders(Borders::ALL)
@@ -791,22 +803,35 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
     if app.data.tasks.is_empty() {
         tasks_lines.push(Line::from(Span::raw("(no tasks)")));
     } else {
+        let sel = app.tasks_scroll.min(app.data.tasks.len() - 1);
+        let sel_task = &app.data.tasks[sel];
+        tasks_lines.push(Line::from(Span::styled("(selected)", Style::default().add_modifier(Modifier::BOLD))));
+        tasks_lines.push(Line::from(Span::raw(sel_task.text.clone())));
+        if !sel_task.tags.is_empty() {
+            tasks_lines.push(Line::from(Span::raw(format!("tags: {}", sel_task.tags.join(", ")))));
+        }
+        tasks_lines.push(Line::from(Span::raw("")));
         let today = Local::now().date_naive();
         for (i, t) in app.data.tasks.iter().enumerate() {
-            let mut s = t.text.clone();
             let mut style = Style::default();
-            if let Some(ca) = &t.completed_at {
+            let prefix = if let Some(ca) = &t.completed_at {
                 if let Ok(ndt) = NaiveDateTime::parse_from_str(ca, "%Y-%m-%dT%H:%M:%S") {
                     if ndt.date() == today {
                         style = style.add_modifier(Modifier::DIM);
-                        s = format!("✓ {}", s);
+                        "✓"
+                    } else {
+                        "•"
                     }
+                } else {
+                    "•"
                 }
-            }
-            if i == app.tasks_scroll && app.focus == Focus::Tasks {
+            } else {
+                "•"
+            };
+            if app.focus == Focus::Tasks && i == sel {
                 style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
             }
-            tasks_lines.push(Line::from(Span::styled(s, style)));
+            tasks_lines.push(Line::from(Span::styled(format!("{} {}", prefix, t.text), style)));
         }
     }
     f.render_widget(Paragraph::new(tasks_lines).block(tasks_block).wrap(Wrap { trim: false }), top_cols[0]);
@@ -817,43 +842,22 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
     let entry_block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled("NEW ENTRY", Style::default().add_modifier(Modifier::BOLD)))
-        .border_style(if app.focus == Focus::Entry {
-            Style::default().fg(Color::Green)
-        } else {
-            Style::default()
-        });
-    f.render_widget(
-        Paragraph::new(Line::from(app.entry_buffer.clone()))
-            .block(entry_block)
-            .wrap(Wrap { trim: false }),
-        top_cols[1],
-    );
+        .border_style(if app.focus == Focus::Entry { Style::default().fg(Color::Green) } else { Style::default() });
+    f.render_widget(Paragraph::new(Line::from(app.entry_buffer.clone())).block(entry_block).wrap(Wrap { trim: false }), top_cols[1]);
 
     // -----------------------
-    // SEARCH (bottom-left) — selected result shown at top (keeps selection visible)
+    // SEARCH (bottom-left) — selected result shown at top
     // -----------------------
     let search_block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled("SEARCH", Style::default().add_modifier(Modifier::BOLD)))
-        .border_style(if app.focus == Focus::Search {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default()
-        });
+        .border_style(if app.focus == Focus::Search { Style::default().fg(Color::Cyan) } else { Style::default() });
 
     let mut search_lines: Vec<Line> = Vec::new();
-    // input line + spacer
-    search_lines.push(Line::from(Span::styled(
-        format!("> {}", app.search_input),
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
+    search_lines.push(Line::from(Span::styled(format!("> {}", app.search_input), Style::default().add_modifier(Modifier::BOLD))));
     search_lines.push(Line::from(Span::raw("")));
     if let Some((dk, entry)) = &app.search_selected_detail {
-        // explicit detail open — show it
-        search_lines.push(Line::from(Span::styled(
-            format!("{} {}", dk, entry.time),
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
+        search_lines.push(Line::from(Span::styled(format!("{} {}", dk, entry.time), Style::default().add_modifier(Modifier::BOLD))));
         search_lines.push(Line::from(Span::raw(&entry.text)));
         if !entry.tags.is_empty() {
             search_lines.push(Line::from(Span::raw(format!("tags: {}", entry.tags.join(", ")))));
@@ -861,26 +865,17 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
         search_lines.push(Line::from(Span::raw("")));
         search_lines.push(Line::from(Span::raw("(Press Backspace when search input empty to clear detail)")));
     } else {
-        // no detail open — show selected result top + list below
         if app.search_results.is_empty() {
             search_lines.push(Line::from(Span::raw("(no results)")));
         } else {
             let sel = app.search_scroll.min(app.search_results.len() - 1);
             let (sel_date, sel_entry) = &app.search_results[sel];
-            // header + full text for selected
-            search_lines.push(Line::from(Span::styled(
-                format!("{} {}", sel_date, sel_entry.time),
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
-            search_lines.push(Line::from(Span::styled(
-                sel_entry.text.clone(),
-                Style::default().add_modifier(Modifier::UNDERLINED),
-            )));
+            search_lines.push(Line::from(Span::styled(format!("{} {}", sel_date, sel_entry.time), Style::default().add_modifier(Modifier::BOLD))));
+            search_lines.push(Line::from(Span::styled(sel_entry.text.clone(), Style::default().add_modifier(Modifier::UNDERLINED))));
             if !sel_entry.tags.is_empty() {
                 search_lines.push(Line::from(Span::raw(format!("tags: {}", sel_entry.tags.join(", ")))));
             }
             search_lines.push(Line::from(Span::raw("")));
-            // full list (selected summary highlighted)
             for (i, (date, entry)) in app.search_results.iter().enumerate() {
                 let mut style = Style::default();
                 if app.focus == Focus::Search && i == sel {
@@ -890,52 +885,32 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
             }
         }
     }
-    f.render_widget(
-        Paragraph::new(search_lines).block(search_block).wrap(Wrap { trim: false }),
-        bottom_cols[0],
-    );
+    f.render_widget(Paragraph::new(search_lines).block(search_block).wrap(Wrap { trim: false }), bottom_cols[0]);
 
-        // -----------------------
-    // JOURNAL (bottom-right) — selected entry shown at top (selected index from app.journal_scroll)
+    // -----------------------
+    // JOURNAL (bottom-right) — selected entry at top then list
     // -----------------------
     let journal_block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled("CATALOGUE", Style::default().add_modifier(Modifier::BOLD)))
-        .border_style(if app.focus == Focus::Journal {
-            Style::default().fg(Color::Blue)
-        } else {
-            Style::default()
-        });
+        .border_style(if app.focus == Focus::Journal { Style::default().fg(Color::Blue) } else { Style::default() });
 
     let mut journal_lines: Vec<Line> = Vec::new();
-    // Gather today's entries (reverse chronological)
     let today_key = Local::now().format("%Y_%m_%d").to_string();
     if let Some(entries) = app.data.journal.get(&today_key) {
         if entries.is_empty() {
             journal_lines.push(Line::from(Span::raw("(no entries today)")));
         } else {
-            // clone entries into a local vec we can index
             let mut rev = entries.clone();
             rev.reverse();
-
-            // selected index (safe clamp) - convert u16 -> usize for indexing
             let sel = (app.journal_scroll as usize).min(rev.len() - 1);
-
-            // clone the selected entry so we don't borrow from `rev`
             let sel_entry = rev[sel].clone();
-
-            // selected entry first (owned strings)
-            journal_lines.push(Line::from(Span::styled(
-                format!("{} {}", today_key, sel_entry.time.clone()),
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
+            journal_lines.push(Line::from(Span::styled(format!("{} {}", today_key, sel_entry.time.clone()), Style::default().add_modifier(Modifier::BOLD))));
             journal_lines.push(Line::from(Span::raw(sel_entry.text.clone())));
             if !sel_entry.tags.is_empty() {
                 journal_lines.push(Line::from(Span::raw(format!("tags: {}", sel_entry.tags.join(", ")))));
             }
             journal_lines.push(Line::from(Span::raw("")));
-
-            // then full list, with selected one highlighted
             for (i, e) in rev.iter().enumerate() {
                 let mut style = Style::default();
                 if app.focus == Focus::Journal && i == sel {
@@ -947,10 +922,5 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
     } else {
         journal_lines.push(Line::from(Span::raw("(no entries today)")));
     }
-
-    f.render_widget(
-        Paragraph::new(journal_lines).block(journal_block).wrap(Wrap { trim: false }),
-        bottom_cols[1],
-    );
-
+    f.render_widget(Paragraph::new(journal_lines).block(journal_block).wrap(Wrap { trim: false }), bottom_cols[1]);
 }
