@@ -712,6 +712,11 @@ fn handle_key_event(app: &mut AppState, key: KeyEvent) -> Result<()> {
 }
 
 /// Render the UI with 3-line header (logo left, date+location on right bottom header).
+/// Scrolling behavior:
+/// - TASKS & SEARCH compute a view offset so the selected index is visible.
+/// - JOURNAL uses app.journal_scroll as an explicit offset (clamped).
+/// Render the UI with 3-line header (logo left, date+location on right bottom header).
+/// Selected-item-at-top behavior for SEARCH, TASKS and JOURNAL so selection is always visible.
 fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -747,8 +752,11 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
     let date_str = Local::now().format("%A, %e %B").to_string();
     let location_display = if app.location.is_empty() { "Unknown" } else { &app.location };
     let meta = format!("Working from {} on {}", location_display, date_str.trim());
-    let meta_para = Paragraph::new(Line::from(Span::styled(meta, Style::default().add_modifier(Modifier::BOLD))))
-        .block(Block::default());
+    let meta_para = Paragraph::new(Line::from(Span::styled(
+        meta,
+        Style::default().add_modifier(Modifier::BOLD),
+    )))
+    .block(Block::default());
     if right_cols.len() >= 3 {
         f.render_widget(meta_para, right_cols[2]);
     } else if let Some(col) = right_cols.last() {
@@ -771,7 +779,9 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
         .split(rows[1]);
 
+    // -----------------------
     // TASKS
+    // -----------------------
     let tasks_block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled("TASKS", Style::default().add_modifier(Modifier::BOLD)))
@@ -801,24 +811,49 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
     }
     f.render_widget(Paragraph::new(tasks_lines).block(tasks_block).wrap(Wrap { trim: false }), top_cols[0]);
 
-    // ENTRY
+    // -----------------------
+    // ENTRY (top-right)
+    // -----------------------
     let entry_block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled("NEW ENTRY", Style::default().add_modifier(Modifier::BOLD))) //(Enter=submit, Shift+Enter=newline)
-        .border_style(if app.focus == Focus::Entry { Style::default().fg(Color::Green) } else { Style::default() });
-    f.render_widget(Paragraph::new(Line::from(app.entry_buffer.clone())).block(entry_block).wrap(Wrap { trim: false }), top_cols[1]);
+        .title(Span::styled("NEW ENTRY", Style::default().add_modifier(Modifier::BOLD)))
+        .border_style(if app.focus == Focus::Entry {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default()
+        });
+    f.render_widget(
+        Paragraph::new(Line::from(app.entry_buffer.clone()))
+            .block(entry_block)
+            .wrap(Wrap { trim: false }),
+        top_cols[1],
+    );
 
-    // SEARCH
+    // -----------------------
+    // SEARCH (bottom-left) — selected result shown at top (keeps selection visible)
+    // -----------------------
     let search_block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled("SEARCH", Style::default().add_modifier(Modifier::BOLD)))//(comma-separated). Enter (with input) runs search; Enter (empty input) opens selected
-        .border_style(if app.focus == Focus::Search { Style::default().fg(Color::Cyan) } else { Style::default() });
+        .title(Span::styled("SEARCH", Style::default().add_modifier(Modifier::BOLD)))
+        .border_style(if app.focus == Focus::Search {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        });
 
     let mut search_lines: Vec<Line> = Vec::new();
-    search_lines.push(Line::from(Span::styled(format!("> {}", app.search_input), Style::default().add_modifier(Modifier::BOLD))));
+    // input line + spacer
+    search_lines.push(Line::from(Span::styled(
+        format!("> {}", app.search_input),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
     search_lines.push(Line::from(Span::raw("")));
     if let Some((dk, entry)) = &app.search_selected_detail {
-        search_lines.push(Line::from(Span::styled(format!("{} {}", dk, entry.time), Style::default().add_modifier(Modifier::BOLD))));
+        // explicit detail open — show it
+        search_lines.push(Line::from(Span::styled(
+            format!("{} {}", dk, entry.time),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
         search_lines.push(Line::from(Span::raw(&entry.text)));
         if !entry.tags.is_empty() {
             search_lines.push(Line::from(Span::raw(format!("tags: {}", entry.tags.join(", ")))));
@@ -826,39 +861,96 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
         search_lines.push(Line::from(Span::raw("")));
         search_lines.push(Line::from(Span::raw("(Press Backspace when search input empty to clear detail)")));
     } else {
+        // no detail open — show selected result top + list below
         if app.search_results.is_empty() {
             search_lines.push(Line::from(Span::raw("(no results)")));
         } else {
+            let sel = app.search_scroll.min(app.search_results.len() - 1);
+            let (sel_date, sel_entry) = &app.search_results[sel];
+            // header + full text for selected
+            search_lines.push(Line::from(Span::styled(
+                format!("{} {}", sel_date, sel_entry.time),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            search_lines.push(Line::from(Span::styled(
+                sel_entry.text.clone(),
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            )));
+            if !sel_entry.tags.is_empty() {
+                search_lines.push(Line::from(Span::raw(format!("tags: {}", sel_entry.tags.join(", ")))));
+            }
+            search_lines.push(Line::from(Span::raw("")));
+            // full list (selected summary highlighted)
             for (i, (date, entry)) in app.search_results.iter().enumerate() {
                 let mut style = Style::default();
-                if app.focus == Focus::Search && app.search_scroll == i {
+                if app.focus == Focus::Search && i == sel {
                     style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
                 }
                 search_lines.push(Line::from(Span::styled(format!("{} {} — {}", date, entry.time, entry.text), style)));
             }
         }
     }
-    f.render_widget(Paragraph::new(search_lines).block(search_block).wrap(Wrap { trim: false }), bottom_cols[0]);
+    f.render_widget(
+        Paragraph::new(search_lines).block(search_block).wrap(Wrap { trim: false }),
+        bottom_cols[0],
+    );
 
-    // JOURNAL (today)
-    let today_key = Local::now().format("%Y_%m_%d").to_string();
+        // -----------------------
+    // JOURNAL (bottom-right) — selected entry shown at top (selected index from app.journal_scroll)
+    // -----------------------
+    let journal_block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled("CATALOGUE", Style::default().add_modifier(Modifier::BOLD)))
+        .border_style(if app.focus == Focus::Journal {
+            Style::default().fg(Color::Blue)
+        } else {
+            Style::default()
+        });
+
     let mut journal_lines: Vec<Line> = Vec::new();
+    // Gather today's entries (reverse chronological)
+    let today_key = Local::now().format("%Y_%m_%d").to_string();
     if let Some(entries) = app.data.journal.get(&today_key) {
         if entries.is_empty() {
             journal_lines.push(Line::from(Span::raw("(no entries today)")));
         } else {
+            // clone entries into a local vec we can index
             let mut rev = entries.clone();
             rev.reverse();
-            for e in &rev {
-                journal_lines.push(Line::from(Span::raw(format!("{} {}", e.time, e.text))));
+
+            // selected index (safe clamp) - convert u16 -> usize for indexing
+            let sel = (app.journal_scroll as usize).min(rev.len() - 1);
+
+            // clone the selected entry so we don't borrow from `rev`
+            let sel_entry = rev[sel].clone();
+
+            // selected entry first (owned strings)
+            journal_lines.push(Line::from(Span::styled(
+                format!("{} {}", today_key, sel_entry.time.clone()),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            journal_lines.push(Line::from(Span::raw(sel_entry.text.clone())));
+            if !sel_entry.tags.is_empty() {
+                journal_lines.push(Line::from(Span::raw(format!("tags: {}", sel_entry.tags.join(", ")))));
+            }
+            journal_lines.push(Line::from(Span::raw("")));
+
+            // then full list, with selected one highlighted
+            for (i, e) in rev.iter().enumerate() {
+                let mut style = Style::default();
+                if app.focus == Focus::Journal && i == sel {
+                    style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+                }
+                journal_lines.push(Line::from(Span::styled(format!("{} {}", e.time, e.text), style)));
             }
         }
     } else {
         journal_lines.push(Line::from(Span::raw("(no entries today)")));
     }
-    let journal_block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled("CATALOGUE", Style::default().add_modifier(Modifier::BOLD)))
-        .border_style(if app.focus == Focus::Journal { Style::default().fg(Color::Blue) } else { Style::default() });
-    f.render_widget(Paragraph::new(journal_lines).block(journal_block).wrap(Wrap { trim: false }), bottom_cols[1]);
+
+    f.render_widget(
+        Paragraph::new(journal_lines).block(journal_block).wrap(Wrap { trim: false }),
+        bottom_cols[1],
+    );
+
 }
