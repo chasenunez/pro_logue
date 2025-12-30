@@ -1,5 +1,5 @@
 // src/main.rs
-// Pro_logue — updated SELECTION popup: wraps text, full coverage, Enter opens popup from RESULTS
+// Pro_logue — split SEARCH/RESULTS focus so Enter semantics are unambiguous
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -122,16 +122,19 @@ struct DataFile {
 enum Focus {
     Entry,
     Tasks,
-    Search,
+    Search,  // input box
+    Results, // results list (separate focus now)
     Journal,
 }
 
 impl Focus {
+    // Next cycles: Entry -> Tasks -> Search -> Results -> Journal -> Entry ...
     fn next(self) -> Focus {
         match self {
             Focus::Entry => Focus::Tasks,
             Focus::Tasks => Focus::Search,
-            Focus::Search => Focus::Journal,
+            Focus::Search => Focus::Results,
+            Focus::Results => Focus::Journal,
             Focus::Journal => Focus::Entry,
         }
     }
@@ -140,7 +143,8 @@ impl Focus {
             Focus::Entry => Focus::Journal,
             Focus::Tasks => Focus::Entry,
             Focus::Search => Focus::Tasks,
-            Focus::Journal => Focus::Search,
+            Focus::Results => Focus::Search,
+            Focus::Journal => Focus::Results,
         }
     }
 }
@@ -168,7 +172,7 @@ struct AppState {
     location: String,
 
     tasks_state: ListState,
-    search_state: ListState,
+    search_state: ListState,  // state for results list
     journal_state: ListState,
 
     // popup
@@ -745,21 +749,17 @@ fn handle_key_event(app: &mut AppState, key: KeyEvent) -> Result<()> {
             }
             _ => {}
         },
+        // SEARCH: input box. Enter runs a search when there is input. Focus remains on Search.
         Focus::Search => match key {
             KeyEvent { code: KeyCode::Char('g'), modifiers, .. } if modifiers.contains(KeyModifiers::CONTROL) => {
                 app.run_search();
             }
-            // NEW: If there are search results and a selection is active (user moved into RESULTS),
-            // pressing Enter opens the SELECTION popup. Otherwise, Enter runs the search when input present.
             KeyEvent { code: KeyCode::Enter, modifiers, .. } => {
-                // If results exist and a result is selected in the results list, open popup
-                if !app.search_results.is_empty() && app.search_state.selected().is_some() {
-                    app.open_selection_from_search();
-                } else if !app.search_input.trim().is_empty() {
-                    // no active selection -> run search
+                if !app.search_input.trim().is_empty() {
                     app.run_search();
+                    // keep focus in Search — user presses Tab to go to Results
                 } else {
-                    // no input and no results -> nothing
+                    // no-op when no input (to avoid accidentally opening popup)
                 }
                 if modifiers.contains(KeyModifiers::SHIFT) {
                     app.search_input.push('\n');
@@ -796,6 +796,40 @@ fn handle_key_event(app: &mut AppState, key: KeyEvent) -> Result<()> {
                 if !app.search_results.is_empty() {
                     app.search_state.select(Some(app.search_scroll));
                 }
+            }
+            _ => {}
+        },
+        // RESULTS: navigation and Enter opens selection popup
+        Focus::Results => match key {
+            KeyEvent { code: KeyCode::Up, .. } => {
+                if app.search_results.is_empty() {
+                } else if app.search_scroll > 0 {
+                    app.search_scroll -= 1;
+                }
+                if !app.search_results.is_empty() {
+                    app.search_state.select(Some(app.search_scroll));
+                }
+            }
+            KeyEvent { code: KeyCode::Down, .. } => {
+                if !app.search_results.is_empty() {
+                    let max = app.search_results.len().saturating_sub(1);
+                    if app.search_scroll < max {
+                        app.search_scroll += 1;
+                    }
+                }
+                if !app.search_results.is_empty() {
+                    app.search_state.select(Some(app.search_scroll));
+                }
+            }
+            KeyEvent { code: KeyCode::Enter, .. } => {
+                // open popup from results (only when there are results)
+                if !app.search_results.is_empty() {
+                    app.open_selection_from_search();
+                }
+            }
+            KeyEvent { code: KeyCode::Char('g'), modifiers, .. } if modifiers.contains(KeyModifiers::CONTROL) => {
+                // allow Ctrl+g here as well to rerun the search results (useful)
+                app.run_search();
             }
             _ => {}
         },
@@ -935,6 +969,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut AppState) {
         .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
         .split(bottom_cols[0]);
 
+    // Make input block highlight when Search focus is active
     let search_block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
@@ -953,13 +988,18 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut AppState) {
         input_lines.push(Line::from(Span::raw("(Backspace (when input empty) clears detail)")));
     } else {
         input_lines.push(Line::from(Span::styled(format!("> {}", app.search_input), Style::default().add_modifier(Modifier::BOLD))));
-        input_lines.push(Line::from(Span::raw("Press Ctrl+G or Enter (when results selected) to open selection")));
+        input_lines.push(Line::from(Span::raw("Press Enter (when input present) to run search. Tab -> RESULTS to open selected result with Enter")));
         input_lines.push(Line::from(Span::raw("")));
     }
     let input_para = Paragraph::new(input_lines).block(search_block.clone());
     f.render_widget(input_para, search_cols[0]);
 
-    // RESULTS list
+    // RESULTS list (now its own focus). Border highlights when Focus::Results.
+    let results_block = Block::default()
+        .borders(Borders::ALL)
+        .title("RESULTS")
+        .border_style(if app.focus == Focus::Results { Style::default().fg(Color::Cyan) } else { Style::default() });
+
     let mut search_items: Vec<ListItem> = Vec::new();
     if app.search_selected_detail.is_some() {
         search_items.push(ListItem::new(Span::raw("(detail open)")));
@@ -968,15 +1008,16 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut AppState) {
     } else {
         for (i, (date, entry)) in app.search_results.iter().enumerate() {
             let mut style = Style::default();
-            if app.focus == Focus::Search && app.search_scroll == i {
+            // highlight when either Search or Results is the active focus (so user sees selection)
+            if (app.focus == Focus::Search || app.focus == Focus::Results) && app.search_scroll == i {
                 style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
             }
             let text = format!("{} {} — {}", date, entry.time, entry.text);
             search_items.push(ListItem::new(Span::styled(text, style)));
         }
     }
-    let search_list = List::new(search_items).block(Block::default().borders(Borders::ALL).title("RESULTS")).highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
-    if !app.search_results.is_empty() && app.search_selected_detail.is_none() {
+    let search_list = List::new(search_items).block(results_block).highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+    if !app.search_results.is_empty() {
         app.search_state.select(Some(app.search_scroll));
     } else {
         app.search_state.select(None);
@@ -1038,7 +1079,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut AppState) {
         // Clear background under popup (obstruct everything in body)
         f.render_widget(Clear, popup_rect);
 
-        // Popup outer block, centered inside popup_rect
+        // Popup outer block
         let popup_block = Block::default()
             .borders(Borders::ALL)
             .title(Span::styled("SELECTION", Style::default().add_modifier(Modifier::BOLD)))
@@ -1112,7 +1153,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut AppState) {
             let mut s = String::new();
             s.push_str(&format!("{} {}\n\n", entry.time, entry.text));
             if !entry.tags.is_empty() {
-                s.push_str(&format!("\nTags: {}\n", entry.tags.join(", ")));
+                s.push_str(&format!("Tags: {}\n", entry.tags.join(", ")));
             }
             s
         };
