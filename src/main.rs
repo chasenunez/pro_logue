@@ -32,6 +32,7 @@ const AUTHOR_NAME: &str = "Chase Núñez";
 const AUTHOR_EMAIL: &str = "chasenunez@gmail.com";
 const GIT_REMOTE_NAME: &str = "origin";
 const GIT_BRANCH: &str = "main";
+const LOG_COLD_STORAGE_NAME: &str = "deep_logue";
 
 const LOGO: &str = r#"┏━┓┏━┓┏━┓   ╻  ┏━┓┏━╸╻ ╻┏━╸
 ┣━┛┣┳┛┃ ┃   ┃  ┃ ┃┃╺┓┃ ┃┣╸ 
@@ -84,7 +85,7 @@ fn normalize_repo_path<P: AsRef<str>>(s: P) -> PathBuf {
 }
 
 fn data_file_name() -> String {
-    format!("{}.json", Local::now().year())
+    format!("{}.json", LOG_COLD_STORAGE_NAME)//Local::now().year())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -885,7 +886,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut AppState) {
     }
 
     // Date + location (right header, bottom header row)
-    let date_str = Local::now().format("%A, %e %B").to_string();
+    let date_str = Local::now().format("%A,%e %B").to_string();
     let location_display = if app.location.is_empty() { "Unknown" } else { &app.location };
     let meta = format!("Working from {} on {}", location_display, date_str.trim());
     let meta_para = Paragraph::new(Line::from(Span::styled(meta, Style::default().add_modifier(Modifier::BOLD))))
