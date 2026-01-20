@@ -1,5 +1,4 @@
 // src/main.rs
-// Pro_logue — split SEARCH/RESULTS focus so Enter semantics are unambiguous
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -26,13 +25,13 @@ use serde::{Deserialize, Serialize};
 /// ---------------------------
 ///// === CONFIGURATION ===
 /// ---------------------------
-const GIT_REPO_PATH: &str = "~/Documents/log_cold_storage/";
+const GIT_REPO_PATH: &str = "YOUR_REPO_PATH_GOES_HERE";
 const COMMIT_AND_PUSH: bool = true;
-const AUTHOR_NAME: &str = "Chase Núñez";
-const AUTHOR_EMAIL: &str = "chasenunez@gmail.com";
+const AUTHOR_NAME: &str = "YOUR_NAME_GOES_HERE";
+const AUTHOR_EMAIL: &str = "YOUR_EMAIL_ADDRESS_GOES_HERE";
 const GIT_REMOTE_NAME: &str = "origin";
 const GIT_BRANCH: &str = "main";
-const LOG_COLD_STORAGE_NAME: &str = "deep_logue";
+const LOG_COLD_STORAGE_NAME: &str = "YOUR_FILE_NAME_HERE";
 
 const LOGO: &str = r#"┏━┓┏━┓┏━┓   ╻  ┏━┓┏━╸╻ ╻┏━╸
 ┣━┛┣┳┛┃ ┃   ┃  ┃ ┃┃╺┓┃ ┃┣╸ 
