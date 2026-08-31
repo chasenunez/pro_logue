@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/1118204953.svg)](https://doi.org/10.5281/zenodo.22206774)
+
 # pro_logue
 
 A terminal-based electronic lab notebook/bullet journal written in Rust for users that want to keep a record of what they are doing, when they are doing it, and want to be able to store this securely in silica.
